@@ -1,4 +1,4 @@
-module normalizer
+module market_feed
 
 go 1.23.4
 

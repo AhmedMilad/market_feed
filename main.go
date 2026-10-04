@@ -1,7 +1,7 @@
 package main
 
 import (
-	"normalizer/utils"
+	"market_feed/utils"
 	"sync"
 )
 
