@@ -1,19 +1,19 @@
 package main
 
 import (
+	"log"
 	"market_feed/utils"
-	"sync"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
 
-	topic := "quickstart-events"
-	message := "test message"
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v", err)
+	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go utils.ConsumeMessage(topic, &wg)
-	utils.PublishMessage(topic, message)
+	utils.GetMarketFeed()
 
-	wg.Wait()
 }
