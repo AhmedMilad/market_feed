@@ -2,32 +2,56 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-func PublishMessage(topic, message string) {
-	partition := 0
+func PublishMessage(topic, key, message string) {
+	// The job of the key here is to enforce queuing mechanism.
+	// Same keys will be routed to the same partition.
+	// If you dont care about the order drop the key.
 
-	conn, err := kafka.DialLeader(context.Background(), "tcp", "localhost:9092", topic, partition)
-	if err != nil {
-		log.Fatal("failed to dial leader:", err)
+	host := os.Getenv("KAFKA_HOST")
+
+	w := &kafka.Writer{
+		Addr:                   kafka.TCP(host),
+		Topic:                  topic,
+		AllowAutoTopicCreation: true,
 	}
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err = conn.WriteMessages(
-		kafka.Message{Value: []byte(message)},
-	)
-
-	if err != nil {
-		log.Fatal("failed to write messages:", err)
+	messages := []kafka.Message{
+		{
+			Key:   []byte(key),
+			Value: []byte(message),
+		},
 	}
 
-	if err := conn.Close(); err != nil {
+	var err error
+	const retries = 3
+	for i := 0; i < retries; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// attempt to create topic prior to publishing the message
+		err = w.WriteMessages(ctx, messages...)
+		if errors.Is(err, kafka.LeaderNotAvailable) || errors.Is(err, context.DeadlineExceeded) {
+			time.Sleep(time.Millisecond * 250)
+			continue
+		}
+
+		if err != nil {
+			log.Fatalf("unexpected error %v", err)
+		}
+		break
+	}
+
+	if err := w.Close(); err != nil {
 		log.Fatal("failed to close writer:", err)
 	}
 }
@@ -36,8 +60,10 @@ func ConsumeMessage(topic string, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 
+	host := os.Getenv("KAFKA_HOST")
+
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"localhost:9092"},
+		Brokers: []string{host},
 		Topic:   topic,
 		GroupID: "my-consumer-group",
 	})
