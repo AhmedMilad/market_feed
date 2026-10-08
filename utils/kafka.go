@@ -12,7 +12,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-func PublishMessage(topic, key, message string) {
+func PublishMessage(topic, key string, message []byte) {
 	// The job of the key here is to enforce queuing mechanism.
 	// Same keys will be routed to the same partition.
 	// If you dont care about the order drop the key.
@@ -28,7 +28,7 @@ func PublishMessage(topic, key, message string) {
 	messages := []kafka.Message{
 		{
 			Key:   []byte(key),
-			Value: []byte(message),
+			Value: message,
 		},
 	}
 
