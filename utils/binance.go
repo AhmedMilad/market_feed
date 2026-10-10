@@ -2,12 +2,18 @@ package utils
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 
+	"context"
+	"time"
+
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
 type SubscribeMessage struct {
@@ -39,6 +45,10 @@ type AggResponse struct {
 	TradeTime    int64  `json:"trade_time"`
 	IsBuyerMaker bool   `json:"is_buyer_maker"`
 	EventTime    int64  `json:"event_time"`
+}
+
+type SymbolResp struct {
+	Symbol string `json:"symbol"`
 }
 
 func GetMarketFeed() {
@@ -118,4 +128,77 @@ func GetMarketFeed() {
 		// publish event to kafka topic.
 		PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), jsonData)
 	}
+}
+
+func UpdateSymbolList() error {
+	url := fmt.Sprintf("%v/v3/ticker/price", os.Getenv("BINANCE_API_URL"))
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("could not request Binance symbols: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Binance returned HTTP status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("could not read response body: %w", err)
+	}
+
+	var symbols []SymbolResp
+	if err := json.Unmarshal(body, &symbols); err != nil {
+		return fmt.Errorf("could not parse Binance symbols: %w", err)
+	}
+
+	ctx := context.Background()
+
+	if err := RDB.Set(ctx, "symbols", body, 30*time.Minute).Err(); err != nil {
+		return fmt.Errorf("could not cache symbols in Redis: %w", err)
+	}
+
+	log.Printf("Successfully cached %d symbols", len(symbols))
+
+	return nil
+}
+
+func GetSymbolList(tries int) ([]SymbolResp, error) {
+
+	if tries <= 0 {
+
+		return nil, errors.New("Could not fetch the symbols.")
+
+	}
+
+	ctx := context.Background()
+	key := "symbols"
+
+	body, err := RDB.Get(ctx, key).Bytes()
+
+	if errors.Is(err, redis.Nil) {
+		if err := UpdateSymbolList(); err != nil {
+			return nil, err
+		}
+
+		return GetSymbolList(tries - 1)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	var resp []SymbolResp
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+
+		return nil, fmt.Errorf("could not parse cached symbols: %w", err)
+	}
+
+	return resp, nil
 }

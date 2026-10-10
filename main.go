@@ -14,6 +14,7 @@ func main() {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
+	utils.InitRedis()
 	utils.GetMarketFeed()
 
 }
