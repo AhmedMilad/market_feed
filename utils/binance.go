@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+	"net"
 )
 
 type SubscribeMessage struct {
@@ -52,13 +53,48 @@ type SymbolResp struct {
 }
 
 func GetMarketFeed() {
+
+	for {
+		err := runMarketFeed()
+
+		if err != nil {
+			log.Printf("Market feed disconnected : %v", err)
+		}
+
+		log.Printf("Reconnecting in 5 seconds.")
+
+		time.Sleep(5 * time.Second)
+	}
+
+}
+
+func runMarketFeed() error {
 	url := fmt.Sprintf("%v/stream", os.Getenv("BINANCE_WSS_URL"))
+
+	const timeout = 60 * time.Second
+	const waitTime = 10 * time.Second
 
 	conn, _, err := websocket.DefaultDialer.Dial(url, http.Header{})
 	if err != nil {
-		log.Fatal("failed to connect:", err)
+		return fmt.Errorf("failed to connect: %w", err)
 	}
 	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("Failed to set initial read deadline: %w", err)
+	}
+
+	conn.SetPingHandler(func(appData string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+
+		return conn.WriteControl(
+			websocket.PongMessage,
+			[]byte(appData),
+			time.Now().Add(waitTime),
+		)
+	})
 
 	log.Println("Connected!")
 
@@ -70,17 +106,26 @@ func GetMarketFeed() {
 		},
 	}
 
+	// avoid write blocks
+	if err := conn.SetWriteDeadline(time.Now().Add(waitTime)); err != nil {
+		return fmt.Errorf("failed to set subscription write deadline: %w", err)
+	}
+
 	if err := conn.WriteJSON(subscription); err != nil {
-		log.Fatal("failed to send subscription:", err)
+		return fmt.Errorf("failed to send subscription: %w", err)
 	}
 
 	log.Println("Subscription sent!")
 
 	for {
 		messageType, message, err := conn.ReadMessage()
+
 		if err != nil {
-			log.Println("connection closed:", err)
-			break
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return fmt.Errorf("WebSocket read timed out: %w", err)
+			}
+			return fmt.Errorf("WebSocket read failed: %w", err)
+
 		}
 
 		if messageType != websocket.TextMessage {
@@ -126,7 +171,11 @@ func GetMarketFeed() {
 		}
 
 		// publish event to kafka topic.
-		PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), jsonData)
+		err = PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), jsonData)
+
+		if err != nil {
+			return err
+		}
 	}
 }
 

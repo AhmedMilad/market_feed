@@ -12,7 +12,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-func PublishMessage(topic, key string, message []byte) {
+func PublishMessage(topic, key string, message []byte) error {
 	// The job of the key here is to enforce queuing mechanism.
 	// Same keys will be routed to the same partition.
 	// If you dont care about the order drop the key.
@@ -52,8 +52,10 @@ func PublishMessage(topic, key string, message []byte) {
 	}
 
 	if err := w.Close(); err != nil {
-		log.Fatal("failed to close writer:", err)
+		return fmt.Errorf("failed to close writer:", err)
 	}
+
+	return nil
 }
 
 func ConsumeMessage(topic string, wg *sync.WaitGroup) {
