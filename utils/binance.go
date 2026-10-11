@@ -8,13 +8,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	"context"
 	"time"
 
+	"net"
+
+	"net/url"
+
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
-	"net"
 )
 
 type SubscribeMessage struct {
@@ -50,6 +54,13 @@ type AggResponse struct {
 
 type SymbolResp struct {
 	Symbol string `json:"symbol"`
+}
+
+type CryptoInfo struct {
+	IsHealthy bool     `json:"is_healthy"`
+	TradeID   int64    `json:"trade_id"`
+	FromID    int64    `json:"from_id"`
+	Buffer    [][]byte `json:"buffer"`
 }
 
 func GetMarketFeed() {
@@ -170,13 +181,238 @@ func runMarketFeed() error {
 			continue
 		}
 
-		// publish event to kafka topic.
-		err = PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), jsonData)
+		Publish(d.Symbol, d.TradeID, d.TradeID, jsonData)
+	}
+}
+
+func Publish(symbol string, tradeID, fromID int64, data []byte) error {
+
+	ctx := context.Background()
+
+	data, err := RDB.Get(ctx, symbol).Bytes()
+
+	if err != nil {
+		// check if this is you have already the crypto in you cache
+		if errors.Is(err, redis.Nil) {
+
+			var crytoInfo CryptoInfo = CryptoInfo{
+				TradeID:   tradeID,
+				IsHealthy: true,
+				FromID:    fromID,
+			}
+
+			jsonData, err := json.Marshal(crytoInfo)
+
+			if err != nil {
+				return fmt.Errorf("Error marshaling to JSON: %w", err)
+			}
+
+			if err := RDB.Set(ctx, symbol, jsonData, 30*time.Minute).Err(); err != nil {
+				return fmt.Errorf("could not cache symbols in Redis: %w", err)
+			}
+
+			// publish event to kafka topic.
+			err = PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), data)
+
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		return err
+	}
+
+	var cryptoInfo CryptoInfo
+
+	if err := json.Unmarshal(data, &cryptoInfo); err != nil {
+		return fmt.Errorf("could not parse the crypto info: %w", err)
+	}
+
+	if cryptoInfo.IsHealthy {
+
+		// skip market feed with lower than or equal trade id
+		if tradeID <= cryptoInfo.TradeID {
+			return nil
+		}
+
+		// valid to publish as this is the next trade id.
+		if tradeID == cryptoInfo.TradeID+1 {
+
+			err = PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), data)
+
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		if tradeID > cryptoInfo.TradeID+1 {
+
+			// mark this crypto as unhealthy
+			// buffer the upcoming messages that are higher than the current trade id
+			// make an api call to catch up to the difference
+			// mark the crypto as healthy
+			// release the buffer once we finish
+
+			cryptoInfo.IsHealthy = false
+			jsonData, err := json.Marshal(cryptoInfo)
+
+			if err != nil {
+				return fmt.Errorf("Error marshaling to JSON: %w", err)
+			}
+
+			if err := RDB.Set(ctx, symbol, jsonData, 30*time.Minute).Err(); err != nil {
+				return fmt.Errorf("could not cache symbols in Redis: %w", err)
+			}
+
+			// A job that will run in the background to fix the crypto order
+			go fixSymbol(symbol, fromID, tradeID+1)
+		}
+	} else {
+		// append to the buffer list
+		cryptoInfo.Buffer = append(cryptoInfo.Buffer, data)
+		jsonData, err := json.Marshal(cryptoInfo)
 
 		if err != nil {
-			return err
+			return fmt.Errorf("Error marshaling to JSON: %w", err)
+		}
+
+		if err := RDB.Set(ctx, symbol, jsonData, 30*time.Minute).Err(); err != nil {
+			return fmt.Errorf("could not cache symbols in Redis: %w", err)
 		}
 	}
+
+	return nil
+}
+
+func fixSymbol(symbol string, fromID, targetTradeID int64) error {
+
+	// api fetch aggrigated trades
+	// publish them to kafka server
+	// make sure the crypto is safe
+	// mark the crypto as health
+
+	cur := fromID
+	const limit string = "1000" // maximum allowed limit from Binance
+
+	for {
+
+		baseURL := fmt.Sprintf("%v/v3/aggTrades", os.Getenv("BINANCE_API_URL"))
+
+		u, err := url.Parse(baseURL)
+
+		if err != nil {
+			return fmt.Errorf("could not parse the base URL: %w", err)
+		}
+
+		q := u.Query()
+
+		sFromID := strconv.FormatInt(cur, 10)
+
+		q.Add("symbol", symbol)
+		q.Add("limit", limit)
+		q.Add("fromId", sFromID)
+
+		u.RawQuery = q.Encode()
+
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+		}
+
+		resp, err := client.Get(u.String())
+		if err != nil {
+			return fmt.Errorf("could not request the aggregated trades: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("Binance returned HTTP status: %s", resp.Status)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("could not read response body: %w", err)
+		}
+
+		var responseData []Data
+		if err := json.Unmarshal(body, &responseData); err != nil {
+			return fmt.Errorf("could not parse the aggregated trades: %w", err)
+		}
+
+		isOk := false
+
+		for _, v := range responseData {
+
+			if v.TradeID == targetTradeID {
+				isOk = true
+				break
+			}
+
+			aggResp := AggResponse{
+				Symbol:       v.Symbol,
+				TradeID:      v.TradeID,
+				Price:        v.Price,
+				Quantity:     v.Quantity,
+				TradeTime:    v.TradeTime,
+				IsBuyerMaker: v.IsBuyerMake,
+				EventTime:    v.EventTime,
+			}
+
+			jsonData, err := json.Marshal(aggResp)
+			if err != nil {
+				return fmt.Errorf("Error marshalling: %v", err)
+			}
+
+			err = PublishMessage(os.Getenv("AGG_FEED_TOPIC"), os.Getenv("AGG_FEED_KEY"), jsonData)
+
+			if err != nil {
+				return err
+			}
+
+			cur = v.TradeID
+		}
+
+		if isOk {
+			break
+		}
+	}
+
+	ctx := context.Background()
+
+	body, err := RDB.Get(ctx, symbol).Bytes()
+
+	if err != nil {
+
+		if errors.Is(err, redis.Nil) {
+			return nil
+		}
+		return err
+	}
+
+	var cryptoInfo CryptoInfo
+
+	if err := json.Unmarshal(body, &cryptoInfo); err != nil {
+
+		return fmt.Errorf("could not parse cached symbols: %w", err)
+	}
+
+	if len(cryptoInfo.Buffer) > 0 {
+		cryptoInfo.Buffer = cryptoInfo.Buffer[1:]
+	}
+
+	jsonData, err := json.Marshal(cryptoInfo)
+	if err != nil {
+		return fmt.Errorf("Error marshalling: %w", err)
+	}
+
+	if err := RDB.Set(ctx, symbol, jsonData, 30*time.Minute).Err(); err != nil {
+		return fmt.Errorf("could not cache the crypto info: %w", err)
+	}
+
+	return nil
 }
 
 func UpdateSymbolList() error {
